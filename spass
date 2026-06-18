@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""spass - simple password manager for ssh credentials.
+
+encrypted with gpg symmetric encryption (aes256).
+no clouds, no servers, no bloat. just you and your gpg key.
+
+usage:
+  spass init                          initialize encrypted store
+  spass add <name> [opts]             add a credential
+  spass get <name> [-q]               show a credential
+  spass list                          list all credentials
+  spass rm <name>                     remove a credential
+  spass ssh <name> [-- <ssh args>]    ssh into host using stored creds
+  spass copy <name>                   copy password to clipboard
+  spass edit <name>                   edit a credential (re-adds it)
+
+options for add:
+  --host HOST          ssh host
+  --user USER          ssh username
+  -p, --port PORT      ssh port
+  --password PASS      password (omit for prompt)
+  -f, --force          overwrite existing
+
+examples:
+  spass add myserver --host example.com --user root -p 22
+  spass add acreetion --host us.iso.acreetionos.org --user natalie -p 2400
+  spass ssh acreetion
+  spass get acreetion -q | xclip
+"""
+
+import json
+import os
+import subprocess
+import sys
+import argparse
+import shutil
+import getpass
+from pathlib import Path
+
+STORE_DIR = Path.home() / '.spass'
+STORE_FILE = STORE_DIR / 'store.gpg'
+VERSION = '1.0.0'
+
+# master password from env (for headless use — normally gpg-agent handles this)
+_MASTER_PW = os.environ.get('SPASS_PW') or ''
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def ensure_store():
+    STORE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _gpg_base_cmd():
+    """return base gpg command, adding loopback/passphrase if SPASS_PW is set."""
+    cmd = ['gpg', '--quiet']
+    if _MASTER_PW:
+        cmd += ['--batch', '--yes',
+                '--pinentry-mode', 'loopback',
+                '--passphrase', _MASTER_PW]
+    return cmd
+
+
+def decrypt():
+    """decrypt and return the store data."""
+    if not STORE_FILE.exists():
+        return {'credentials': {}}
+    cmd = _gpg_base_cmd() + ['--decrypt', str(STORE_FILE)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        err = r.stderr.strip()
+        if 'decryption failed' in err or 'bad key' in err or 'No secret key' in err:
+            die("decryption failed — wrong master password?")
+        die(f"gpg decryption failed: {err or 'unknown error'}")
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        die("store file is corrupted")
+
+
+def encrypt(data):
+    """encrypt data dict and write to store file."""
+    ensure_store()
+    j = json.dumps(data, indent=2, ensure_ascii=False) + '\n'
+    cmd = _gpg_base_cmd() + [
+        '--symmetric', '--cipher-algo', 'AES256',
+        '--output', str(STORE_FILE)
+    ]
+    r = subprocess.run(cmd, input=j, capture_output=True, text=True)
+    if r.returncode != 0:
+        # fallback: try without loopback (for gpg-agent / pinentry)
+        cmd2 = ['gpg', '--quiet', '--symmetric', '--cipher-algo', 'AES256',
+                '--output', str(STORE_FILE)]
+        r = subprocess.run(cmd2, input=j, capture_output=True, text=True)
+    if r.returncode != 0:
+        err = r.stderr.strip()
+        die(f"encryption failed: {err or 'gpg returned {r.returncode}'}")
+
+
+def get_cred(data, name):
+    creds = data.get('credentials', {})
+    if name not in creds:
+        die(f"credential '{name}' not found")
+    return creds[name]
+
+
+# ── commands ──────────────────────────────────────────────────────────
+
+def cmd_init(args):
+    ensure_store()
+    if STORE_FILE.exists():
+        # verify we can decrypt it
+        decrypt()
+        print(f"store already exists at {STORE_FILE}")
+        return
+    encrypt({'credentials': {}})
+    print(f"initialized encrypted store at {STORE_FILE}")
+    print("you'll be prompted for a master password — remember it!")
+
+
+def cmd_add(args):
+    data = decrypt()
+    creds = data.setdefault('credentials', {})
+
+    if args.name in creds and not args.force:
+        die(f"'{args.name}' already exists (use --force to overwrite)")
+
+    cred = {}
+
+    # gather fields — cli arg or prompt
+    cred['host'] = args.host
+    while not cred.get('host'):
+        cred['host'] = input("host: ").strip()
+
+    cred['user'] = args.user
+    while not cred.get('user'):
+        cred['user'] = input("user: ").strip()
+
+    if args.port is not None:
+        cred['port'] = args.port
+    else:
+        port_str = input("port [22]: ").strip()
+        cred['port'] = int(port_str) if port_str else 22
+
+    if args.password:
+        cred['password'] = args.password
+    else:
+        p1 = getpass.getpass("password: ")
+        p2 = getpass.getpass("confirm: ")
+        if p1 != p2:
+            die("passwords don't match")
+        cred['password'] = p1
+
+    creds[args.name] = cred
+    encrypt(data)
+    print(f"✓ added '{args.name}' ({cred['user']}@{cred['host']}:{cred['port']})")
+
+
+def cmd_get(args):
+    data = decrypt()
+    cred = get_cred(data, args.name)
+
+    if args.quiet:
+        print(cred.get('password', ''))
+        return
+
+    print(f"name:     {args.name}")
+    print(f"host:     {cred.get('host', '?')}")
+    print(f"user:     {cred.get('user', '?')}")
+    print(f"port:     {cred.get('port', 22)}")
+    pw = cred.get('password', '')
+    if pw:
+        print(f"password: {pw}")
+    kf = cred.get('keyfile', '')
+    if kf:
+        print(f"keyfile:  {kf}")
+
+
+def cmd_list(args):
+    data = decrypt()
+    creds = data.get('credentials', {})
+    if not creds:
+        print("no credentials stored yet")
+        print("  spass add <name> --host <host> --user <user>")
+        return
+
+    # column widths
+    names = list(creds.keys())
+    max_name = max(len(n) for n in names) if names else 0
+    for name in sorted(creds.keys()):
+        c = creds[name]
+        port_str = f":{c.get('port', 22)}"
+        print(f"  {name.ljust(max_name)}  {c.get('user', '?')}@{c.get('host', '?')}{port_str}")
+
+
+def cmd_rm(args):
+    data = decrypt()
+    creds = data.get('credentials', {})
+    if args.name not in creds:
+        die(f"'{args.name}' not found")
+    confirm = input(f"remove '{args.name}'? [y/N] ").strip().lower()
+    if confirm != 'y':
+        print("cancelled")
+        return
+    del creds[args.name]
+    encrypt(data)
+    print(f"✓ removed '{args.name}'")
+
+
+def cmd_ssh(args):
+    data = decrypt()
+    cred = get_cred(data, args.name)
+
+    host = cred.get('host', '')
+    user = cred.get('user', '')
+    port = cred.get('port', 22)
+    password = cred.get('password', '')
+
+    if not host or not user:
+        die(f"'{args.name}' is missing host or user")
+
+    ssh_cmd = ['ssh']
+    if port != 22:
+        ssh_cmd += ['-p', str(port)]
+    ssh_cmd.append(f'{user}@{host}')
+
+    # append any extra ssh args (after --)
+    if args.extra:
+        ssh_cmd += args.extra
+
+    if password and shutil.which('sshpass'):
+        pw_cmd = ['sshpass', '-p', password] + ssh_cmd
+        print(f"connecting to {user}@{host}:{port} ...")
+        os.execvp(pw_cmd[0], pw_cmd)
+    elif password:
+        print("note: sshpass not found, password won't be auto-injected")
+        print(f"password: {password}")
+        os.execvp(ssh_cmd[0], ssh_cmd)
+    else:
+        print(f"connecting to {user}@{host}:{port} (key auth) ...")
+        os.execvp(ssh_cmd[0], ssh_cmd)
+
+
+def cmd_copy(args):
+    data = decrypt()
+    cred = get_cred(data, args.name)
+    password = cred.get('password', '')
+    if not password:
+        die("no password stored for this entry")
+
+    copied = False
+    if shutil.which('xclip'):
+        subprocess.run(['xclip', '-selection', 'clipboard'], input=password, text=True)
+        copied = True
+    elif shutil.which('xsel'):
+        subprocess.run(['xsel', '--clipboard', '--input'], input=password, text=True)
+        copied = True
+
+    if copied:
+        print(f"✓ password for '{args.name}' copied to clipboard")
+    else:
+        # fallback — print and warn
+        print(f"password for '{args.name}': {password}")
+        print("(install xclip to auto-copy)")
+
+
+def cmd_edit(args):
+    """edit a credential by removing and re-adding it."""
+    data = decrypt()
+    creds = data.get('credentials', {})
+    if args.name not in creds:
+        die(f"'{args.name}' not found")
+
+    # copy existing creds so we can edit interactively
+    old = creds[args.name]
+    print(f"editing '{args.name}' (leave blank to keep current value)")
+    print()
+
+    host = input(f"host [{old.get('host', '')}]: ").strip()
+    if not host:
+        host = old.get('host', '')
+
+    user = input(f"user [{old.get('user', '')}]: ").strip()
+    if not user:
+        user = old.get('user', '')
+
+    port_str = input(f"port [{old.get('port', 22)}]: ").strip()
+    port = int(port_str) if port_str else old.get('port', 22)
+
+    pw_change = input("change password? [y/N] ").strip().lower()
+    if pw_change == 'y':
+        p1 = getpass.getpass("password: ")
+        p2 = getpass.getpass("confirm: ")
+        if p1 != p2:
+            die("passwords don't match")
+        password = p1
+    else:
+        password = old.get('password', '')
+
+    creds[args.name] = {
+        'host': host,
+        'user': user,
+        'port': port,
+        'password': password,
+    }
+    encrypt(data)
+    print(f"✓ updated '{args.name}'")
+
+
+# ── main ──────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='spass',
+        description='simple password manager for ssh credentials',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+    parser.add_argument('--version', action='version', version=f'spass {VERSION}')
+    sub = parser.add_subparsers(dest='cmd')
+
+    # init
+    sub.add_parser('init', help='initialize the encrypted store')
+
+    # add
+    p_add = sub.add_parser('add', help='add a credential')
+    p_add.add_argument('name', help='credential name (e.g. "myserver")')
+    p_add.add_argument('--host', help='ssh hostname or ip')
+    p_add.add_argument('--user', help='ssh username')
+    p_add.add_argument('-p', '--port', type=int, help='ssh port (default: 22)')
+    p_add.add_argument('--password', help='password (omit for prompt)')
+    p_add.add_argument('-f', '--force', action='store_true',
+                       help='overwrite existing credential')
+
+    # get
+    p_get = sub.add_parser('get', help='show credential details')
+    p_get.add_argument('name', help='credential name')
+    p_get.add_argument('-q', '--quiet', action='store_true',
+                       help='show only the password (useful for piping)')
+
+    # list
+    sub.add_parser('list', aliases=['ls'], help='list all credentials')
+
+    # rm
+    p_rm = sub.add_parser('rm', help='remove a credential')
+    p_rm.add_argument('name', help='credential name')
+
+    # ssh
+    p_ssh = sub.add_parser('ssh', help='ssh into host using stored credentials')
+    p_ssh.add_argument('name', help='credential name')
+    p_ssh.add_argument('extra', nargs=argparse.REMAINDER,
+                       help='extra arguments passed to ssh (use -- to separate)')
+
+    # copy
+    p_copy = sub.add_parser('copy', help='copy password to clipboard')
+    p_copy.add_argument('name', help='credential name')
+
+    # edit
+    p_edit = sub.add_parser('edit', help='edit an existing credential')
+    p_edit.add_argument('name', help='credential name')
+
+    args = parser.parse_args()
+
+    # handle aliases
+    if args.cmd == 'ls':
+        args.cmd = 'list'
+
+    cmds = {
+        'init': cmd_init,
+        'add': cmd_add,
+        'get': cmd_get,
+        'list': cmd_list,
+        'rm': cmd_rm,
+        'ssh': cmd_ssh,
+        'copy': cmd_copy,
+        'edit': cmd_edit,
+    }
+
+    if args.cmd not in cmds or args.cmd is None:
+        parser.print_help()
+        sys.exit(1)
+
+    # if the store doesn't exist and cmd isn't init, auto-init
+    if args.cmd != 'init' and not STORE_FILE.exists():
+        print("store not found — initializing ...")
+        encrypt({'credentials': {}})
+        print(f"created {STORE_FILE}")
+
+    cmds[args.cmd](args)
+
+
+if __name__ == '__main__':
+    main()
